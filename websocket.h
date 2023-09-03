@@ -3,8 +3,28 @@
 
 #include <string>
 #include <vector>
+#include <memory>
 
 namespace Whale {
+struct WsFrame
+{
+    int fin;
+    int opcode;
+    int mask;
+    int mask_key;
+    int payload_len;
+    std::unique_ptr<char[]> payload;
+};
+
+enum class FrameType {
+    CONTINUATION = 0x0,
+    TEXT = 0x1,
+    BINARY = 0x2,
+    CLOSE = 0x8,
+    PING = 0x9,
+    PONG = 0xa
+};
+
 class WebSocketServer {
 public:
     WebSocketServer() = default;
@@ -18,12 +38,12 @@ public:
 
     bool Start(std::string_view sockName);
     bool UpgradeWebSocket();
+    bool HttpReponse(std::string_view message);
     void Stop();
 
     void Send(const std::string& message);
 
-    void OnMessage(const std::string& message);
-    void onError(const std::string& message);
+    void OnMessage();
 
 private:
     WebSocketServer* server_;

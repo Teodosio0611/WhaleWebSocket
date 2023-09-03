@@ -1,10 +1,13 @@
 #include "websocket.h"
-#include "utils.hpp"
 
+#include <iostream>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <string.h>
 #include <unistd.h>
+#include <sstream>
+#include <openssl/sha.h>
+#include <openssl/evp.h>
 
 namespace Whale {
 bool WebSocketServer::Start(std::string_view sockName)
@@ -33,43 +36,8 @@ bool WebSocketServer::Start(std::string_view sockName)
         return false;
     }
 
-    UpgradeWebSocket();
+    return UpgradeWebSocket();
 }
-
-// split string_view by delimiter
-std::vector<std::string_view> Split(std::string_view str, std::string_view delimiter)
-{
-    std::vector<std::string_view> result;
-    size_t pos = 0;
-    while (pos < str.size()) {
-        size_t eol = str.find(delimiter, pos);
-        if (eol == std::string_view::npos) {
-            break;
-        }
-        result.push_back(str.substr(pos, eol - pos));
-        pos = eol + delimiter.size();
-    }
-    return result;
-}
-
-std::tuple<std::string_view, std::string_view, std::string_view> ParseRequestLine(std::string_view line)
-{
-    auto parts = Split(line, " ");
-    if (parts.size() != 3) {
-        return std::make_tuple("", "", "");
-    }
-    return std::make_tuple(parts[0], parts[1], parts[2]);
-}
-
-std::tuple<std::string_view, std::string_view> ParseHeader(std::string_view line)
-{
-    auto parts = Split(line, ": ");
-    if (parts.size() != 2) {
-        return std::make_tuple("", "");
-    }
-    return std::make_tuple(parts[0], parts[1]);
-}
-
 
 bool WebSocketServer::UpgradeWebSocket()
 {
@@ -91,53 +59,81 @@ bool WebSocketServer::UpgradeWebSocket()
         pos = eol + 2;
     }
 
-    if (lines.size() < 3) {
+    if (lines.size() < 2) {
+        return false;
+    }
+    if (lines[0].find("HTTP/1/1") != std::string_view::npos) {
         return false;
     }
 
-    std::string_view method, path, version;
-    auto [method, path, version] = ParseRequestLine(lines[0]);
-    if (method != "GET") {
+    if (lines[2].find("Upgrade: websocket") == std::string_view::npos) {
         return false;
     }
 
-    std::string_view connection, upgrade, secWebSocketKey;
-    auto [connection, upgrade] = ParseHeader(lines[1]);
-    if (connection != "Upgrade" || upgrade != "websocket") {
+    if (lines[4].find("Sec-WebSocket-Key: ") == std::string_view::npos) {
         return false;
     }
 
-    std::string_view secWebSocketVersion;
-    auto [secWebSocketVersion, secWebSocketKey] = ParseHeader(lines[2]);
-    if (secWebSocketVersion != "Sec-WebSocket-Version" || secWebSocketKey != "13") {
+    if (lines[5].find("Sec-WebSocket-Version: 13") == std::string_view::npos) {
         return false;
     }
 
-    std::string_view secWebSocketAccept;
-    auto [secWebSocketAccept, secWebSocketKey] = ParseHeader(lines[3]);
-    if (secWebSocketAccept != "Sec-WebSocket-Accept") {
-        return false;
+    std::string key = lines[4].substr(19).data();
+    key.append("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    unsigned char hash[20];
+    char acceptKey[32];
+    SHA1(reinterpret_cast<const unsigned char*>(key.c_str()), strlen(reinterpret_cast<const char*>(key.c_str())), hash);
+    EVP_EncodeBlock(reinterpret_cast<unsigned char*>(acceptKey), hash, 20);
+    HttpReponse(acceptKey);
+    return true;
+}
+
+bool WebSocketServer::HttpReponse(std::string_view message)
+{
+    std::ostringstream ss;
+    ss << "HTTP/1.1 200 OK\r\n";
+    ss << "Content-Type: text/plain\r\n";
+    ss << "Content-Length: " << message.size() << "\r\n";
+    ss << "Connection: close\r\n";
+    ss << "\r\n";
+    ss << message;
+    std::string response = ss.str();
+    write(client_, response.data(), response.size());
+    return true;
+}
+
+void WebSocketServer::OnMessage()
+{
+    WsFrame frame;
+    int index = 2;
+    char buf[1024];
+    read(client_, buf, sizeof(buf));
+    frame.fin = (buf[0] >> 7) & 0x1;
+    frame.opcode = buf[0] & 0xf;
+    frame.mask = (buf[1] >> 7) & 0x1;
+    frame.payload_len = buf[1] & 0x7f;
+    if (frame.payload_len == 126) {
+        index += 2;
+        frame.payload_len = (buf[2] << 8) | buf[3];
+    } else if (frame.payload_len == 127) {
+        index += 8;
+        frame.payload_len = (buf[2] << 56) | (buf[3] << 48) | (buf[4] << 40) | (buf[5] << 32) | (buf[6] << 24) | (buf[7] << 16) | (buf[8] << 8) | buf[9];
     }
 
-    std::string_view secWebSocketProtocol;
-    std::tie(secWebSocketProtocol, secWebSocketKey) = ParseHeader(lines[4]);
-    if (secWebSocketProtocol != "Sec-WebSocket-Protocol") {
-        return false;
+    if (frame.mask == 1) {
+        index += 4;
+        frame.mask_key = (buf[index - 4] << 24) | (buf[index - 3] << 16) | (buf[index - 2] << 8) | buf[index - 1];
     }
 
-    std::string_view origin;
-    std::tie(origin, secWebSocketKey) = ParseHeader(lines[5]);
-    if (origin != "Origin") {
-        return false;
+    if (frame.mask == 1) {
+        for (int i = 0; i < frame.payload_len; ++i) {
+            buf[index + i] ^= buf[index + i % 4];
+        }
     }
 
-    std::string_view secWebSocketExtensions;
-    std::tie(secWebSocketExtensions, secWebSocketKey) = ParseHeader(lines[6]);
-    if (secWebSocketExtensions != "Sec-WebSocket-Extensions") {
-        return false;
-    }
-
-    std::string_view emptyLine;
-    std::
+    frame.payload.reset(new char[frame.payload_len]);
+    char* payload = frame.payload.get();
+    memcpy(payload, buf + index, frame.payload_len);
+    std::cout << frame.payload.get() << std::endl;
 }
 }
